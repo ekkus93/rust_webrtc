@@ -304,7 +304,10 @@ class TunnelForegroundServiceOrderingTest {
             "the retried start must succeed and leave the tunnel running",
             waitForCondition { deps.tunnelRepository.status.value.serviceState.isTunnelRunning() },
         )
-        assertFalse(service.pausedByPolicy.get())
+        assertTrue(
+            "the verified retry completion must clear the policy-paused marker",
+            waitForCondition { !service.pausedByPolicy.get() },
+        )
 
         // P2-001: drain the FIFO queue with a STOP barrier instead of sleeping — any spurious
         // extra retry enqueued during the race would have run before STOP, proving exactly once.
