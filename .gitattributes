@@ -1,0 +1,22 @@
+# Normalize line endings on checkout so Windows clones with core.autocrlf=true
+# (the common default) don't silently convert source files to CRLF. Several
+# checks depend on this: rustfmt.toml pins newline_style = "Unix", and some
+# tests read source files and compare against literal "\n"-delimited strings.
+* text=auto eol=lf
+
+*.rs text eol=lf
+*.kt text eol=lf
+*.kts text eol=lf
+*.sh text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Binary files: never touch these.
+*.jar binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
