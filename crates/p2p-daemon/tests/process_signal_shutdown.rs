@@ -12,6 +12,14 @@
 //! regression gate already runs before this test). When `P2P_REQUIRE_SIGNAL_TEST=1`
 //! is set (as the required CI job does), a missing prerequisite is a hard failure
 //! rather than a skip — see `required_signal_test()`.
+//!
+//! Unix-only: asserts on real SIGINT/SIGTERM delivery via `ExitStatusExt::signal()`,
+//! which has no Windows equivalent (Windows has no POSIX signal numbers; the
+//! production `#[cfg(not(unix))]` shutdown path in `process_signal.rs` uses
+//! `tokio::signal::ctrl_c()` instead, which this test does not exercise). CI only
+//! runs this on `ubuntu-latest`/`macos-latest`.
+
+#![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;

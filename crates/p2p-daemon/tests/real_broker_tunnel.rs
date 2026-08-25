@@ -13,6 +13,13 @@
 //! Requires Docker. If Docker is unavailable the test logs a skip and passes, so
 //! `cargo test` stays green in environments without Docker. CI must provide Docker
 //! for this to actually exercise the broker path.
+//!
+//! Unix-only: the mosquitto container's certs are host bind-mounts that must be
+//! made world-readable/traversable (`PermissionsExt::set_mode`) for the in-container
+//! user to read them — a POSIX permission-bits concept with no Windows equivalent.
+//! CI only ever runs this on `ubuntu-latest` (see `docker-e2e` in `ci.yml`).
+
+#![cfg(unix)]
 
 use std::net::TcpListener as StdTcpListener;
 use std::os::unix::fs::PermissionsExt;
