@@ -12,6 +12,15 @@ use super::{
     resolve_config_path, write_identity_files,
 };
 
+/// Renders a path for embedding in a hand-written TOML basic string. `Path::display()`
+/// yields raw backslashes on Windows (e.g. `C:\Users\...`), and TOML basic strings treat
+/// `\` as the start of an escape sequence -- `\U` in particular starts an 8-digit Unicode
+/// escape, so an unescaped Windows path fails to parse with "invalid unicode 8-digit hex
+/// code". Doubling backslashes is what any correct TOML writer already does for a `Path`.
+fn toml_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "\\\\")
+}
+
 #[test]
 fn keygen_refuses_to_overwrite_without_force() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -356,14 +365,14 @@ status_socket = ""
 write_status_file = true
 status_file = "{status_file}"
 "#,
-        identity = identity_path.display(),
-        authorized_keys = dir.join("authorized_keys").display(),
-        state_dir = dir.join("state").display(),
-        log_dir = dir.join("state/log").display(),
-        password_file = dir.join("mqtt_password").display(),
-        ca_file = dir.join("ca.crt").display(),
-        log_file = dir.join("state/log/p2ptunnel.log").display(),
-        status_file = dir.join("state/status.json").display(),
+        identity = toml_path(&identity_path),
+        authorized_keys = toml_path(&dir.join("authorized_keys")),
+        state_dir = toml_path(&dir.join("state")),
+        log_dir = toml_path(&dir.join("state/log")),
+        password_file = toml_path(&dir.join("mqtt_password")),
+        ca_file = toml_path(&dir.join("ca.crt")),
+        log_file = toml_path(&dir.join("state/log/p2ptunnel.log")),
+        status_file = toml_path(&dir.join("state/status.json")),
     );
     std::fs::write(&config_path, config).expect("write config");
     config_path
@@ -526,14 +535,14 @@ status_socket = ""
 write_status_file = true
 status_file = "{status_file}"
 "#,
-        identity = identity_path.display(),
-        authorized_keys = dir.join("authorized_keys").display(),
-        state_dir = dir.join("state").display(),
-        log_dir = dir.join("state/log").display(),
-        password_file = dir.join("mqtt_password").display(),
-        ca_file = dir.join("ca.crt").display(),
-        log_file = dir.join("state/log/p2ptunnel.log").display(),
-        status_file = dir.join("state/status.json").display(),
+        identity = toml_path(&identity_path),
+        authorized_keys = toml_path(&dir.join("authorized_keys")),
+        state_dir = toml_path(&dir.join("state")),
+        log_dir = toml_path(&dir.join("state/log")),
+        password_file = toml_path(&dir.join("mqtt_password")),
+        ca_file = toml_path(&dir.join("ca.crt")),
+        log_file = toml_path(&dir.join("state/log/p2ptunnel.log")),
+        status_file = toml_path(&dir.join("state/status.json")),
     );
     std::fs::write(&config_path, config).expect("write config");
     config_path

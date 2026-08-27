@@ -234,6 +234,36 @@ jobs:
           P2P_ANSWER_BIN: ${{ github.workspace }}/target/debug/p2p-answer
         run: cargo test -p p2p-daemon --test process_signal_shutdown -- --nocapture
 
+  test-windows:
+    name: Test (Windows)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.expected_sha || github.sha }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Run tests
+        run: cargo test --workspace --all-targets --all-features
+      # Deliberately narrower than the Linux/macOS jobs. Not run here:
+      #   - the Docker broker E2E, because windows-latest runners cannot
+      #     reliably host Linux containers;
+      #   - the real-process signal lifecycle test, because Windows has no
+      #     SIGINT/SIGTERM -- `process_signal_shutdown.rs` is `#![cfg(unix)]`.
+      #     A Windows equivalent driven by the Service Control Manager's
+      #     SERVICE_CONTROL_STOP belongs with the service work.
+
   android:
     name: Android
     needs: changes
@@ -376,6 +406,7 @@ jobs:
       - lint
       - test
       - test-macos
+      - test-windows
       - android
       - docker-e2e
       - android-emulator-e2e
@@ -393,6 +424,7 @@ jobs:
           LINT_RESULT: ${{ needs.lint.result }}
           LINUX_RESULT: ${{ needs.test.result }}
           MACOS_RESULT: ${{ needs.test-macos.result }}
+          WINDOWS_RESULT: ${{ needs.test-windows.result }}
           ANDROID_RESULT: ${{ needs.android.result }}
           DOCKER_E2E_RESULT: ${{ needs.docker-e2e.result }}
           ANDROID_EMULATOR_E2E_RESULT: ${{ needs.android-emulator-e2e.result }}
@@ -417,10 +449,12 @@ jobs:
             require_result "Rust lint" "$LINT_RESULT" success
             require_result "Linux tests" "$LINUX_RESULT" success
             require_result "macOS tests" "$MACOS_RESULT" success
+            require_result "Windows tests" "$WINDOWS_RESULT" success
           else
             require_result "Rust lint" "$LINT_RESULT" skipped
             require_result "Linux tests" "$LINUX_RESULT" skipped
             require_result "macOS tests" "$MACOS_RESULT" skipped
+            require_result "Windows tests" "$WINDOWS_RESULT" skipped
           fi
 
           if [ "$ANDROID_REQUIRED" = true ]; then

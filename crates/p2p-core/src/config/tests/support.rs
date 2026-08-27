@@ -6,6 +6,17 @@ use std::path::Path;
 
 pub(super) use crate::config::{AndroidIceMode, AppConfig, expand_home};
 
+/// Renders a path for embedding in a hand-written TOML basic string. `Path::display()`
+/// yields raw backslashes on Windows (e.g. `C:\Users\...`), and TOML basic strings treat
+/// `\` as the start of an escape sequence -- `\U` in particular starts an 8-digit Unicode
+/// escape, so an unescaped Windows path fails to parse with "invalid unicode 8-digit hex
+/// code". Doubling backslashes is what any correct TOML writer (e.g. `toml::to_string`)
+/// already does for a `Path`/`PathBuf`; these fixtures build TOML by hand, so it must be
+/// done explicitly here.
+pub(super) fn toml_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "\\\\")
+}
+
 pub(super) fn sample_config(config_dir: &Path, state_dir: &Path) -> String {
     format!(
         r#"
@@ -98,14 +109,14 @@ status_socket = ""
 write_status_file = true
 status_file = "{status_file}"
 "#,
-        identity = config_dir.join("identity").display(),
-        authorized_keys = config_dir.join("authorized_keys").display(),
-        state_dir = state_dir.display(),
-        log_dir = state_dir.join("log").display(),
-        password_file = config_dir.join("mqtt_password").display(),
-        ca_file = config_dir.join("ca.crt").display(),
-        log_file = state_dir.join("log/p2ptunnel.log").display(),
-        status_file = state_dir.join("status.json").display(),
+        identity = toml_path(&config_dir.join("identity")),
+        authorized_keys = toml_path(&config_dir.join("authorized_keys")),
+        state_dir = toml_path(state_dir),
+        log_dir = toml_path(&state_dir.join("log")),
+        password_file = toml_path(&config_dir.join("mqtt_password")),
+        ca_file = toml_path(&config_dir.join("ca.crt")),
+        log_file = toml_path(&state_dir.join("log/p2ptunnel.log")),
+        status_file = toml_path(&state_dir.join("status.json")),
     )
 }
 
@@ -154,13 +165,13 @@ pub(super) fn render_documented_sample(
     state_dir: &Path,
 ) -> String {
     sample
-        .replace("__IDENTITY__", &config_dir.join("identity").display().to_string())
-        .replace("__AUTHORIZED_KEYS__", &config_dir.join("authorized_keys").display().to_string())
-        .replace("__STATE_DIR__", &state_dir.display().to_string())
-        .replace("__LOG_DIR__", &state_dir.join("log").display().to_string())
-        .replace("__CA_FILE__", &config_dir.join("ca.crt").display().to_string())
-        .replace("__LOG_FILE__", &state_dir.join("log/p2ptunnel.log").display().to_string())
-        .replace("__STATUS_FILE__", &state_dir.join("status.json").display().to_string())
+        .replace("__IDENTITY__", &toml_path(&config_dir.join("identity")))
+        .replace("__AUTHORIZED_KEYS__", &toml_path(&config_dir.join("authorized_keys")))
+        .replace("__STATE_DIR__", &toml_path(state_dir))
+        .replace("__LOG_DIR__", &toml_path(&state_dir.join("log")))
+        .replace("__CA_FILE__", &toml_path(&config_dir.join("ca.crt")))
+        .replace("__LOG_FILE__", &toml_path(&state_dir.join("log/p2ptunnel.log")))
+        .replace("__STATUS_FILE__", &toml_path(&state_dir.join("status.json")))
 }
 
 /// Write required files + load `config`, returning the parse/validate result.

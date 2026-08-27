@@ -1,0 +1,106 @@
+//! The operating-system seam for the tunnel.
+//!
+//! Everything in the rest of the workspace is portable logic: protocol framing,
+//! crypto, config *schema* and validation rules, the WebRTC data plane. The
+//! handful of things that genuinely differ per OS -- where a user's home
+//! directory lives, and how "only I can read this private key" is expressed --
+//! live here, behind one small interface with a per-OS implementation.
+//!
+//! Android is a unix and uses the unix implementation unchanged.
+//!
+//! Note on the security functions: [`ensure_private_file_permissions`] and
+//! [`ensure_not_writable_by_others`] back the `security.refuse_world_readable_identity`
+//! and `security.refuse_world_writable_paths` config knobs, which
+//! `AppConfig::validate` refuses to let you disable. Not every platform can
+//! enforce them; [`ENFORCES_FILE_PERMISSIONS`] says whether this one does, so
+//! callers can be honest about it rather than silently reporting success.
+
+use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+#[path = "unix.rs"]
+mod imp;
+#[cfg(windows)]
+#[path = "windows.rs"]
+mod imp;
+
+/// Whether this platform actually enforces the private-file permission checks
+/// that [`ensure_private_file_permissions`] and [`ensure_not_writable_by_others`]
+/// describe.
+///
+/// `false` means those two functions are advisory no-ops here and the
+/// protection has to come from somewhere else (on Windows: a restrictive DACL
+/// on the config directory, applied at install time). Callers that promise
+/// these guarantees to a user should surface this rather than imply enforcement
+/// that is not happening.
+pub const ENFORCES_FILE_PERMISSIONS: bool = imp::ENFORCES_FILE_PERMISSIONS;
+
+/// The current user's home directory, or `None` if it cannot be determined.
+///
+/// Unix reads `HOME`. Windows prefers `USERPROFILE` -- the native value -- and
+/// only falls back to `HOME`, because POSIX-emulation shells (Git Bash, MSYS)
+/// set `HOME` to a unix-shaped path like `/c/Users/name` that is not a valid
+/// Windows path.
+pub fn home_dir() -> Option<PathBuf> {
+    imp::home_dir()
+}
+
+/// Rejects a private key file that other users on this machine can read.
+///
+/// A no-op on platforms where [`ENFORCES_FILE_PERMISSIONS`] is `false`.
+pub fn ensure_private_file_permissions(path: &Path) -> Result<(), PlatformError> {
+    imp::ensure_private_file_permissions(path)
+}
+
+/// Rejects a path that other users on this machine can write to.
+///
+/// Checks the nearest existing ancestor when `path` itself does not exist yet,
+/// so a not-yet-created file inside a world-writable directory is still caught.
+/// A no-op on platforms where [`ENFORCES_FILE_PERMISSIONS`] is `false`.
+pub fn ensure_not_writable_by_others(path: &Path) -> Result<(), PlatformError> {
+    imp::ensure_not_writable_by_others(path)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PlatformError {
+    /// The path exists but its permissions are weaker than required.
+    #[error("{0}")]
+    Permission(String),
+    /// The path could not be inspected.
+    #[error("failed to inspect '{path}': {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+// Only the unix implementation inspects the filesystem; the Windows one cannot
+// yet (see `windows.rs`), so this constructor has no caller there.
+#[cfg(unix)]
+impl PlatformError {
+    pub(crate) fn io(path: &Path, source: std::io::Error) -> Self {
+        PlatformError::Io { path: path.to_path_buf(), source }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn home_dir_is_absolute_when_present() {
+        // Whatever this platform reports, it must be usable as a base path to
+        // join onto -- a relative or unix-shaped value would silently produce
+        // wrong paths on Windows.
+        if let Some(home) = home_dir() {
+            assert!(home.is_absolute(), "home_dir() returned a non-absolute path: {home:?}");
+        }
+    }
+
+    #[test]
+    fn empty_path_is_accepted_by_the_writability_check() {
+        // An unset optional config path is not a permission failure.
+        ensure_not_writable_by_others(Path::new("")).expect("empty path should be accepted");
+    }
+}

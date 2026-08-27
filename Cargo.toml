@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/p2p-platform",
   "crates/p2p-core",
   "crates/p2p-crypto",
   "crates/p2p-signaling",

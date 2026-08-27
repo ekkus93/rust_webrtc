@@ -68,9 +68,13 @@ fn advertised_local_ipv4_invalid_is_rejected() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     // Garbage, loopback, unspecified, multicast, and out-of-range octets must all fail
     // config validation rather than be advertised as a host candidate.
-    for value in ["garbage", "127.0.0.1", "0.0.0.0", "224.0.0.1", "256.1.1.1", "::1"] {
-        let config_dir = temp_dir.path().join(format!("config-{value}"));
-        let state_dir = temp_dir.path().join(format!("state-{value}"));
+    for (i, value) in
+        ["garbage", "127.0.0.1", "0.0.0.0", "224.0.0.1", "256.1.1.1", "::1"].into_iter().enumerate()
+    {
+        // The directory name uses the loop index, not `value` directly: `::1` contains a
+        // `:`, which is a reserved path character on Windows (drive-letter syntax).
+        let config_dir = temp_dir.path().join(format!("config-{i}"));
+        let state_dir = temp_dir.path().join(format!("state-{i}"));
         let config = sample_config(&config_dir, &state_dir).replace(
             "enable_ice_restart = true",
             &format!("enable_ice_restart = true\nadvertised_local_ipv4 = \"{value}\""),

@@ -6,10 +6,20 @@
 //! and could poison the shared `OnceLock` for every other test in that binary.
 
 use std::fs;
+use std::path::Path;
 
 use p2p_crypto::generate_identity;
 use p2p_mobile::AndroidTunnelController;
 use tracing_subscriber::prelude::*;
+
+/// Renders a path for embedding in a hand-written TOML basic string. `Path::display()`
+/// yields raw backslashes on Windows (e.g. `C:\Users\...`), and TOML basic strings treat
+/// `\` as the start of an escape sequence -- `\U` in particular starts an 8-digit Unicode
+/// escape, so an unescaped Windows path fails to parse with "invalid unicode 8-digit hex
+/// code". Doubling backslashes is what any correct TOML writer already does for a `Path`.
+fn toml_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "\\\\")
+}
 
 #[test]
 fn start_fails_when_tracing_bridge_install_loses_to_an_existing_global_subscriber() {
@@ -124,13 +134,13 @@ status_socket = ""
 write_status_file = true
 status_file = "{status_file}"
 "#,
-            identity = config_dir.join("missing_identity.toml").display(),
-            authorized_keys = config_dir.join("authorized_keys").display(),
-            state_dir = state_dir.display(),
-            log_dir = state_dir.join("log").display(),
-            ca_file = config_dir.join("ca.crt").display(),
-            log_file = state_dir.join("log/p2ptunnel.log").display(),
-            status_file = state_dir.join("status.json").display(),
+            identity = toml_path(&config_dir.join("missing_identity.toml")),
+            authorized_keys = toml_path(&config_dir.join("authorized_keys")),
+            state_dir = toml_path(&state_dir),
+            log_dir = toml_path(&state_dir.join("log")),
+            ca_file = toml_path(&config_dir.join("ca.crt")),
+            log_file = toml_path(&state_dir.join("log/p2ptunnel.log")),
+            status_file = toml_path(&state_dir.join("status.json")),
         ),
     )
     .expect("config");

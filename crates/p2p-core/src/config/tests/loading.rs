@@ -79,9 +79,12 @@ fn ensure_runtime_dirs_creates_missing_directories() {
 
 #[test]
 fn expand_home_uses_current_home_directory() {
-    let home = std::env::var_os("HOME").expect("HOME should be set for tests");
+    // Which variable holds the home directory is OS-specific (`HOME` on unix,
+    // `USERPROFILE` on Windows), so ask the platform seam rather than reading a
+    // unix-only variable that is simply absent in a native Windows shell.
+    let home = p2p_platform::home_dir().expect("the platform should report a home directory");
     let expanded = expand_home(Path::new("~/example")).expect("path should expand");
-    assert_eq!(expanded, std::path::PathBuf::from(home).join("example"));
+    assert_eq!(expanded, home.join("example"));
 }
 
 #[test]
@@ -96,7 +99,7 @@ fn config_allows_anonymous_broker_auth() {
     let config = sample_config(&config_dir, &state_dir)
         .replace("username = \"answer-office\"", "username = \"\"")
         .replace(
-            &format!("password_file = \"{}\"", config_dir.join("mqtt_password").display()),
+            &format!("password_file = \"{}\"", toml_path(&config_dir.join("mqtt_password"))),
             "password_file = \"\"",
         );
     let config_path = temp_dir.path().join("config.toml");
@@ -132,7 +135,7 @@ fn config_allows_mqtts_without_explicit_ca_file() {
     write_required_files(&config_dir);
 
     let config = sample_config(&config_dir, &state_dir)
-        .replace(&format!("ca_file = \"{}\"", config_dir.join("ca.crt").display()), "");
+        .replace(&format!("ca_file = \"{}\"", toml_path(&config_dir.join("ca.crt"))), "");
     let config_path = temp_dir.path().join("config.toml");
     fs::write(&config_path, config).expect("write config");
     AppConfig::load_from_file(&config_path).expect("default-root TLS config");

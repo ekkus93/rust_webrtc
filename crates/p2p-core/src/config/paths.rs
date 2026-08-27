@@ -2,8 +2,6 @@
 //! validating an [`AppConfig`](super::AppConfig): `~/` home expansion, required/
 //! optional file existence checks, and world-writable permission rejection.
 
-use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::ConfigError;
@@ -13,12 +11,16 @@ pub fn expand_home(path: &Path) -> Result<PathBuf, ConfigError> {
         return Ok(path.to_path_buf());
     }
 
-    let home = env::var_os("HOME").ok_or_else(|| {
-        ConfigError::InvalidConfig("HOME environment variable is not set".to_owned())
+    // Which environment variable actually holds the home directory is an OS
+    // detail (`HOME` on unix, `USERPROFILE` on Windows), so it lives behind the
+    // platform seam; expanding the `~/` prefix is portable config logic and
+    // stays here.
+    let home = p2p_platform::home_dir().ok_or_else(|| {
+        ConfigError::InvalidConfig("could not determine the user's home directory".to_owned())
     })?;
 
     let relative = path_string.trim_start_matches("~/");
-    Ok(PathBuf::from(home).join(relative))
+    Ok(home.join(relative))
 }
 
 pub(crate) fn expand_optional_path(path: &Path) -> Result<PathBuf, ConfigError> {
@@ -55,43 +57,18 @@ pub(crate) fn validate_optional_file(
     }
     Ok(())
 }
-#[cfg(unix)]
+/// Rejects a config path that other users on this machine can write to.
+///
+/// The permission model itself is an OS detail and lives behind the platform
+/// seam; this wrapper only attaches the config field name so the error names the
+/// offending knob. On platforms where `p2p_platform::ENFORCES_FILE_PERMISSIONS`
+/// is `false` this is advisory -- see that constant's docs.
 pub(crate) fn validate_non_world_writable(
     path: &Path,
     field_name: &'static str,
 ) -> Result<(), ConfigError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    if path.as_os_str().is_empty() {
-        return Ok(());
-    }
-
-    let mut candidate = path;
-    while !candidate.exists() {
-        candidate = candidate.parent().ok_or_else(|| {
-            ConfigError::InvalidConfig(format!(
-                "{field_name} must be inside an existing directory for path security checks"
-            ))
-        })?;
-    }
-
-    let metadata =
-        fs::metadata(candidate).map_err(|error| ConfigError::io_path(candidate, error))?;
-    if metadata.permissions().mode() & 0o002 != 0 {
-        return Err(ConfigError::InvalidConfig(format!(
-            "{field_name} path '{}' must not be world-writable",
-            candidate.display()
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-pub(crate) fn validate_non_world_writable(
-    _path: &Path,
-    _field_name: &'static str,
-) -> Result<(), ConfigError> {
-    Ok(())
+    p2p_platform::ensure_not_writable_by_others(path)
+        .map_err(|error| ConfigError::InvalidConfig(format!("{field_name}: {error}")))
 }
 
 #[cfg(all(test, unix))]
