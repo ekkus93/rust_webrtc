@@ -94,9 +94,10 @@ or Android.
 (`crates/p2p-core/src/config/validate.rs`). The design intent is unambiguous: these
 protections are mandatory.
 
-Before this work, both checks were `#[cfg(not(unix))]` stubs returning `Ok(())` on Windows,
-across 12 call sites. A security control that the config forbids disabling was silently
-disabled by the platform.
+Before this work, both checks were `#[cfg(not(unix))]` stubs returning `Ok(())` on Windows:
+ten `validate_non_world_writable` call sites in `validate.rs` plus the
+`validate_private_file_permissions` call in `identity.rs`. A security control that the
+config forbids disabling was silently disabled by the platform.
 
 The rule going forward:
 
@@ -272,14 +273,18 @@ not in scope here.
 
 ### 6.2 The platform seam interface
 
-```rust
-pub const ENFORCES_FILE_PERMISSIONS: bool;
+This is the **target** interface. Implementation status is marked, because two of these do
+not exist yet and tasks that call them are blocked on the tasks that add them.
 
-pub fn home_dir() -> Option<PathBuf>;
-pub fn default_config_dir() -> Result<PathBuf, PlatformError>;
-pub fn create_private_file(path: &Path, contents: &[u8]) -> Result<(), PlatformError>;
-pub fn ensure_private_file_permissions(path: &Path) -> Result<(), PlatformError>;
-pub fn ensure_not_writable_by_others(path: &Path) -> Result<(), PlatformError>;
+```rust
+pub const ENFORCES_FILE_PERMISSIONS: bool;                                      // implemented
+
+pub fn home_dir() -> Option<PathBuf>;                                           // implemented
+pub fn ensure_private_file_permissions(path: &Path) -> Result<(), PlatformError>; // implemented
+pub fn ensure_not_writable_by_others(path: &Path) -> Result<(), PlatformError>;   // implemented
+
+pub fn default_config_dir() -> Result<PathBuf, PlatformError>;                  // TODO P0-006
+pub fn create_private_file(path: &Path, contents: &[u8]) -> Result<(), PlatformError>; // TODO P0-004
 ```
 
 `home_dir()` reads `HOME` on unix. On Windows it prefers `USERPROFILE` and only falls back
@@ -307,15 +312,52 @@ creation rather than by a later fixup.
 
 ### 6.4 Service hosting topology
 
+#### Why a separate wrapper binary rather than making `p2p-answer` SCM-aware
+
+`WEBRTC_TUNNEL_SERVICE_LIFECYCLE_SPEC.md` sets a rule this work must not break:
+
+> `p2p-offer` and `p2p-answer` must remain ordinary foreground applications. `systemd`,
+> `launchd`, Docker, a shell, Android, or a test harness may supervise them, but the daemon
+> core must not have a special supervisor-specific mode.
+
+On unix that rule is free, because `systemd` and `launchd` supervise an ordinary foreground
+process from the outside. **Windows is genuinely different.** A service process must call
+`StartServiceCtrlDispatcher` on its main thread shortly after start to connect to the SCM
+and dispatch into `ServiceMain`. An arbitrary console executable cannot be run as a native
+Windows service without either doing that itself or being run under a third-party shim.
+
+So the choice is: give `p2p-answer` a supervisor-specific mode (violating the rule above),
+or put the SCM-specific mode in a separate binary. This spec chooses the second.
+`p2p-offer` and `p2p-answer` stay exactly what they are today on every platform.
+
+#### One binary, two registered services
+
+`p2p-service-windows` takes `--role offer|answer` and is registered **twice**, as two
+independent services, mirroring the unix arrangement of separate `p2p-offer.service` and
+`p2p-answer.service` units:
+
+```text
+  Service "p2ptunnel-answer"              Service "p2ptunnel-offer"
+  binPath: p2p-service-windows.exe        binPath: p2p-service-windows.exe
+           --role answer                           --role offer
+  config:  %ProgramData%\p2ptunnel\       config:  %ProgramData%\p2ptunnel\
+           answer\config.toml                      offer\config.toml
+```
+
+Each service has its own name, its own config directory (the `<role>` element already
+present in §6.3), its own state and log directories, and its own lifecycle. Neither role is
+privileged over the other; the initial deployment happens to install only `answer`, but
+`offer` is registered the same way when needed.
+
 ```text
               Service Control Manager
                        │
              SERVICE_CONTROL_STOP
                        │
                        ▼
-            p2p-service-windows            ← SCM plumbing only
+     p2p-service-windows --role <offer|answer>   ← SCM plumbing only
                        │
-              ShutdownToken                ← existing generic primitive
+              ShutdownToken                      ← existing generic primitive
                        │
                        ▼
         run_answer_daemon / run_offer_daemon

@@ -139,6 +139,11 @@ the `signoff` gate alongside Linux and macOS.
 
 ## P0-004 — Move the remaining unix-only production code behind the seam
 
+**Depends on P0-006**, which adds `default_config_dir()`. Do that task first; the
+`HOME`-replacement step below calls a function that does not exist until it lands. The
+`identity.rs` and `create_private_file` parts of this task have no such dependency and can
+proceed independently.
+
 ### Files
 ```text
 crates/p2p-crypto/src/identity.rs
@@ -166,7 +171,9 @@ lookups. Move them to the seam so `p2p-platform` is genuinely the only OS-aware 
 
 ### Acceptance criteria
 - [ ] `grep -rn 'cfg(unix)' crates bins --include=*.rs` outside `p2p-platform` returns only
-      test files and the Android ICE branches.
+      test files. (The Android ICE branches use `cfg(target_os = "android")`, not
+      `cfg(unix)`, so they will not appear in this grep at all — they are a separate,
+      pre-existing concern and are out of scope.)
 - [ ] `grep -rn 'var_os("HOME")' crates bins --include=*.rs` returns nothing outside
       `p2p-platform`.
 - [ ] `p2pctl keygen` works from native PowerShell, not only Git Bash.
@@ -200,6 +207,8 @@ At daemon startup, if `!p2p_platform::ENFORCES_FILE_PERMISSIONS`, emit a single
 ---
 
 ## P0-006 — Windows config and state directory layout
+
+**P0-004 depends on this task** for `default_config_dir()`. Consider doing it first.
 
 ### Files
 ```text
@@ -245,15 +254,33 @@ Host `run_answer_daemon` / `run_offer_daemon` under the Service Control Manager,
 - Report `SERVICE_STOP_PENDING` with a truthful wait hint while sessions drain, then
   `SERVICE_STOPPED`.
 
-### DECISION REQUIRED
-SCM integration needs either a crate such as `windows-service` or direct Win32 FFI. If the
-chosen crate is not fully safe, this trips `unsafe_code = "forbid"`. Record the approved
-approach here before implementing.
+### On `unsafe_code = "forbid"`
+Read this before assuming a policy exception is needed — the constraint is narrower than it
+first appears.
+
+`unsafe_code` is a **per-crate** lint. It fires on `unsafe` written in *this* crate's own
+source. A dependency being full of `unsafe` internally is irrelevant, so calling a crate
+like `windows-service` through its safe API trips nothing.
+
+The one real hazard is **macro expansion**: `forbid` also fires on `unsafe` that a macro
+expands into our crate, and `forbid` cannot be overridden by an inner `allow`.
+`windows-service` exposes `define_windows_service!`, which generates the `extern "system"`
+entry point. Whether that expansion contains `unsafe` must be **verified empirically** —
+add the dependency, write the smallest possible service skeleton, and see whether it
+compiles under the workspace lint.
+
+Only if it does not compile is there a decision to make, and then the options are: a
+documented `bins/p2p-service-windows` exception on the model of `p2p-mobile`, or a
+different crate. Record the outcome of the experiment here either way.
 
 ### Acceptance criteria
-- [ ] `sc.exe start` / `sc.exe stop` work.
+- [ ] Registered as two independent services per spec §6.4 (`p2ptunnel-answer`,
+      `p2ptunnel-offer`), one binary with `--role`, each with its own config directory.
+- [ ] `sc.exe start` / `sc.exe stop` work for each.
 - [ ] Stop is graceful: exit code 0, terminal `Closed` status, no lingering listeners.
 - [ ] Binary contains no tunnel logic.
+- [ ] `p2p-offer` and `p2p-answer` are unchanged — no supervisor-specific mode is added to
+      either, per the rule quoted in spec §6.4.
 
 ---
 
@@ -430,9 +457,23 @@ grants read access to anyone but the owner, SYSTEM, and Administrators, so
 `ENFORCES_FILE_PERMISSIONS` can become `true` on Windows.
 
 ### DECISION REQUIRED
-Requires `GetNamedSecurityInfo` and ACL walking through Win32 FFI, which trips
-`unsafe_code = "forbid"`. Either approve a documented `p2p-platform` exception on the
-model of `p2p-mobile`, or adopt a vetted safe wrapper crate. Record the decision here.
+Unlike P0-007, this one probably does need a policy call. See P0-007's note for how
+`unsafe_code = "forbid"` actually works — the question is only ever whether `unsafe` ends
+up in *our* crate's source or macro expansion, never whether a dependency contains it.
+
+Calling `GetNamedSecurityInfo` and walking the ACL directly through `windows-sys` is raw
+FFI, which is unambiguously `unsafe` in `p2p-platform` and would be rejected. So this needs
+one of:
+
+1. a vetted safe wrapper crate that exposes DACL inspection without `unsafe` at the call
+   site — investigate availability and maintenance status before committing;
+2. a documented `p2p-platform` exception on the model of `p2p-mobile`; or
+3. shelling out to `icacls` and parsing its output — no `unsafe`, but fragile and
+   locale-sensitive, so treat as a last resort.
+
+Record the decision here. Note this is genuinely optional: P0-008's install-time ACL is what
+provides the actual protection, and this task only upgrades `ENFORCES_FILE_PERMISSIONS`
+from advisory to verified.
 
 ### Acceptance criteria
 - [ ] `ENFORCES_FILE_PERMISSIONS` is `true` on Windows.
