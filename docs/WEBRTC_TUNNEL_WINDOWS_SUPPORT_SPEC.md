@@ -1,0 +1,365 @@
+# WebRTC Tunnel Windows Support Spec
+
+## 1. Purpose
+
+This spec defines how the WebRTC tunnel gains first-class Windows support so that:
+
+1. `p2p-offer` and `p2p-answer` run manually in a terminal on Windows;
+2. Windows peers interoperate with existing Linux, macOS, and Android peers with no
+   protocol, crypto, or wire-format divergence;
+3. the answer role runs as a native Windows service under the Service Control Manager;
+4. the offer role is equally supported, so a Windows host can be either end of a tunnel;
+5. private key material at rest is protected on Windows to a standard equivalent to the
+   `0600` guarantee enforced on unix;
+6. shutdown is clean and truthful when the SCM stops the service; and
+7. the shared Rust core stays usable, unmodified, by the Linux, macOS, and Android builds.
+
+The immediate deployment target is a GPU workstation running the **answer** role as a
+service, forwarding RDP (3389) plus local model-server ports (ollama, llama-server,
+ComfyUI) to a remote offer peer. The offer role on Windows is an explicit requirement but
+a later milestone.
+
+The main architectural rule is:
+
+> The wire protocol, cryptographic identity format, and daemon state machines must remain
+> byte-identical on every platform. Exactly two categories of behavior may differ per OS:
+> **how a secret is protected at rest on local disk**, and **how the process is hosted and
+> asked to stop**. Nothing that crosses the network may differ.
+
+No fork of the codebase, no Windows-specific protocol behavior, and no per-OS branch
+inside the daemon state machines.
+
+---
+
+## 2. Executive design decisions
+
+### 2.1 One codebase, not a Windows fork
+
+The entire unix dependency in production code is five files:
+
+```text
+crates/p2p-core/src/config/paths.rs      HOME expansion, world-writable checks
+crates/p2p-crypto/src/identity.rs        0600 private-key permission check
+crates/p2p-daemon/src/process_signal.rs  SIGINT/SIGTERM handling
+bins/p2pctl/src/commands.rs              HOME, set_permissions on keygen
+bins/p2p-offer|p2p-answer/src/main.rs    HOME for config resolution
+```
+
+Everything else — `p2p-signaling`, `p2p-webrtc`, `p2p-tunnel`, the protocol framing, the
+crypto, the multiplexer, the config *schema* and validation rules — is portable Rust that
+already compiles and passes on Windows.
+
+A separate Windows implementation would fork a codebase that is ~95% identical to
+accommodate five files, and would make protocol drift between platforms a question of
+*when* rather than *if*. That is rejected.
+
+### 2.2 `p2p-mobile` is the precedent
+
+Android is a stranger target than Windows: different libc, no shared filesystem
+conventions, a JNI boundary, its own ICE constraints. It did **not** get a fork. It got a
+thin wrapper crate over the shared core plus a small number of
+`#[cfg(target_os = "android")]` branches. That is what keeps Android interoperating with
+Linux and macOS by construction — it is literally the same code.
+
+Windows follows the same shape and needs less than Android did.
+
+### 2.3 The `p2p-platform` crate is the only place OS differences live
+
+OS-specific code must not accumulate as scattered `#[cfg(unix)]` / `#[cfg(not(unix))]`
+pairs inside crates whose job is portability. `p2p-core` in particular must return to being
+pure schema and validation logic with no OS calls.
+
+All OS divergence lives behind one small crate with a per-OS implementation module.
+Android falls under the unix implementation unchanged.
+
+### 2.4 ed25519 identity and file permissions are orthogonal layers
+
+These were conflated during early design discussion and must not be again:
+
+- **ed25519 keys are the wire layer.** Identity, signing, `authorized_keys`, message
+  verification. Byte-identical on every platform. This is what makes peers interoperate.
+- **File permissions are the local at-rest layer.** "Can another user *on this machine*
+  read my private key file?" This never crosses the wire. A peer has no knowledge of, and
+  no reason to care about, how its counterpart stores its key on disk.
+
+Consequently: Linux checks POSIX mode bits, Windows checks its own equivalent, Android
+relies on app-private storage. **No platform needs to understand another platform's
+permission model.** Windows adopting DACL-based protection imposes nothing on Linux, macOS,
+or Android.
+
+### 2.5 File-permission enforcement must be honest about what it cannot do
+
+`AppConfig::validate` refuses to load a config that disables
+`security.refuse_world_readable_identity` or `security.refuse_world_writable_paths`
+(`crates/p2p-core/src/config/validate.rs`). The design intent is unambiguous: these
+protections are mandatory.
+
+Before this work, both checks were `#[cfg(not(unix))]` stubs returning `Ok(())` on Windows,
+across 12 call sites. A security control that the config forbids disabling was silently
+disabled by the platform.
+
+The rule going forward:
+
+> A platform that cannot enforce a promised security check must report that it cannot,
+> not return success.
+
+`p2p_platform::ENFORCES_FILE_PERMISSIONS` exists for exactly this. Callers that surface
+these guarantees to a user must consult it rather than implying enforcement that is not
+happening.
+
+### 2.6 The Windows service runs under a virtual account
+
+The service runs as `NT SERVICE\p2ptunnel`, not `LocalSystem`.
+
+Rationale: the answer daemon makes outbound connections to the broker and inbound-to-
+localhost connections to forward targets. Neither requires machine-level authority.
+Running a network-facing service that forwards RDP as `LocalSystem` grants an attacker who
+compromises it full machine control for no operational benefit. A virtual account needs no
+password management, is created automatically at install time, and gets a distinct SID that
+the config directory ACL can be scoped to.
+
+### 2.7 At-rest protection on Windows comes from install-time ACLs, not runtime checks
+
+Where the identity file lives determines the actual risk:
+
+- Under `%USERPROFILE%`, the default ACL already restricts access to that user plus SYSTEM
+  and Administrators — effectively equivalent to `0600`.
+- Under `%ProgramData%`, the default inherited ACL commonly grants `BUILTIN\Users` read
+  access. A private key written there with inherited permissions is readable by **every
+  local user**.
+
+Because a service's config belongs under `%ProgramData%`, the second case is the real
+exposure. The fix is to apply a restrictive DACL to the config directory **once, at service
+install time**, granting only the service's virtual account and Administrators.
+
+Runtime DACL *validation* would be defense in depth on top of that. It is deliberately not
+required for correctness, because it needs `GetNamedSecurityInfo` and ACL walking through
+raw Win32 FFI, and the workspace sets `unsafe_code = "forbid"` with `p2p-mobile`'s JNI
+boundary as its single documented exception. Adding a second exception is a policy decision
+to be made explicitly, not smuggled in as an implementation detail.
+
+### 2.8 Shutdown translates SCM control codes into the existing shutdown token
+
+`crates/p2p-daemon/src/process_signal.rs` already has the correct abstraction: daemon state
+machines never observe a signal number, only a `ShutdownToken` derived from one. Windows
+adds a new producer of that token, driven by `SERVICE_CONTROL_STOP`, and changes nothing
+downstream.
+
+The existing `#[cfg(not(unix))]` fallback calls `tokio::signal::ctrl_c()`. That is correct
+for a foreground console process and **insufficient for a service** — the SCM does not send
+console signals. Both paths must exist.
+
+---
+
+## 3. Current repository state
+
+### 3.1 The workspace already builds and passes on Windows
+
+`cargo build --workspace`, `cargo clippy --workspace --all-targets`, and
+`cargo fmt --all --check` are clean on `x86_64-pc-windows-msvc`.
+
+### 3.2 The WebRTC data plane is proven working on Windows
+
+`crates/p2p-daemon/tests/two_node_daemon` drives real `WebRtcPeer::new` →
+`RTCPeerConnection` (see `crates/p2p-daemon/src/answer/session.rs`), negotiates real
+ICE/DTLS/SCTP over loopback, and round-trips real bytes
+`client → tunnel → echo target → back`, including concurrent peers and fault isolation.
+41 tests pass in roughly seven seconds. Only the *signaling* transport is in-memory there;
+the data plane is genuine.
+
+This retires the largest open risk in the port.
+
+### 3.3 What is not yet proven on Windows
+
+- Real MQTT signaling over `mqtts://` (rumqttc + rustls). Cross-platform crates, low risk,
+  but untested — the Docker broker E2E is gated off.
+- Real-network (non-loopback) ICE, NAT traversal, and STUN.
+- Anything service-related: SCM hosting, shutdown via `SERVICE_CONTROL_STOP`.
+
+### 3.4 Two integration tests are unix-gated
+
+`real_broker_tunnel.rs` and `process_signal_shutdown.rs` carry `#![cfg(unix)]` because they
+used `PermissionsExt` and `ExitStatusExt` unconditionally, which prevented the `p2p-daemon`
+test binary from compiling at all on Windows.
+
+`real_broker_tunnel.rs` is legitimately unix-shaped: it `chmod`s certs for a Linux mosquitto
+container's bind mount. `process_signal_shutdown.rs` is different — it points at a real gap,
+because Windows needs an equivalent driven by SCM control codes. That gap is tracked, not
+accepted.
+
+### 3.5 Android is an integration constraint, not a target of this work
+
+Android builds from a Windows host already work end to end (`./gradlew check` passes,
+including the Rust JNI cross-compile via `cargo-ndk`). Eight Kotlin unit tests fail on
+Windows for test-harness portability reasons — `File.setReadable`/`setWritable` are no-ops
+on Windows, one test compares a raw path against a TOML-escaped one, one shells out to bash
+with an unquoted Windows path. These are host-portability defects in the test harness, not
+Android app defects, and must not be fixed by changing app behavior.
+
+---
+
+## 4. Goals
+
+### 4.1 P0 goals
+
+- All OS-specific production code lives behind `p2p-platform`.
+- `cargo fmt`, `cargo clippy`, and `cargo test --workspace` pass on Windows in CI as a
+  required gate.
+- Windows config and state directory layout is defined and implemented.
+- `p2p-answer` runs as a Windows service under a virtual account and stops cleanly on
+  `SERVICE_CONTROL_STOP`.
+- The service installer applies a restrictive DACL to the config directory.
+- Startup honestly reports when a promised permission check is not enforced.
+
+### 4.2 P1 goals
+
+- Real `mqtts://` signaling proven on Windows.
+- Windows shutdown lifecycle test equivalent to `process_signal_shutdown.rs`.
+- Android test-harness portability fixed so `./gradlew check` is green on a Windows host.
+- Offer role validated on Windows against a real remote answer peer.
+
+### 4.3 P2 goals
+
+- MSI or equivalent packaging.
+- Windows added to the release-artifacts matrix.
+- A Windows-native broker E2E replacing the Docker-based one.
+
+---
+
+## 5. Non-goals
+
+- No Windows fork of the codebase.
+- No per-OS branching inside daemon state machines, protocol code, or crypto.
+- No change to signaling wire format, identity format, forward semantics, or WebRTC
+  architecture.
+- No weakening of the fail-closed security knobs in `AppConfig::validate` to accommodate
+  Windows.
+- No `unsafe` in `p2p-platform` unless explicitly approved as a documented workspace policy
+  exception, on the model of `p2p-mobile`.
+- Windows containers and Windows-on-ARM are out of scope.
+
+---
+
+## 6. Required architecture
+
+### 6.1 Layering
+
+```text
+        p2p-offer / p2p-answer / p2pctl / p2p-service-windows
+                              │
+                      p2p-daemon (state machines)
+                              │
+       ┌──────────────┬───────┴────────┬───────────────┐
+       │              │                │               │
+  p2p-signaling  p2p-webrtc      p2p-tunnel      p2p-crypto
+       │              │                │               │
+       └──────────────┴───────┬────────┴───────────────┘
+                              │
+                          p2p-core            ← pure schema + validation
+                              │
+                        p2p-platform          ← the ONLY OS seam
+                              │
+              ┌───────────────┴───────────────┐
+              │                               │
+         platform/unix.rs              platform/windows.rs
+      (Linux, macOS, Android)
+```
+
+Nothing above `p2p-platform` may contain `#[cfg(unix)]`, `#[cfg(windows)]`, or
+`#[cfg(target_os = ...)]` for permission or home-directory concerns. Existing
+Android-specific ICE branches in `p2p-webrtc` are a separate, pre-existing concern and are
+not in scope here.
+
+### 6.2 The platform seam interface
+
+```rust
+pub const ENFORCES_FILE_PERMISSIONS: bool;
+
+pub fn home_dir() -> Option<PathBuf>;
+pub fn default_config_dir() -> Result<PathBuf, PlatformError>;
+pub fn create_private_file(path: &Path, contents: &[u8]) -> Result<(), PlatformError>;
+pub fn ensure_private_file_permissions(path: &Path) -> Result<(), PlatformError>;
+pub fn ensure_not_writable_by_others(path: &Path) -> Result<(), PlatformError>;
+```
+
+`home_dir()` reads `HOME` on unix. On Windows it prefers `USERPROFILE` and only falls back
+to `HOME`, because POSIX-emulation shells (Git Bash, MSYS, Cygwin) set `HOME` to a
+unix-shaped path such as `/c/Users/name`, which `PathBuf` would treat as a drive-relative
+path and silently resolve incorrectly.
+
+### 6.3 Windows filesystem layout
+
+```text
+Service (virtual account NT SERVICE\p2ptunnel):
+  config     %ProgramData%\p2ptunnel\<role>\config.toml
+  identity   %ProgramData%\p2ptunnel\<role>\identity
+  state      %ProgramData%\p2ptunnel\<role>\state\
+  logs       %ProgramData%\p2ptunnel\<role>\state\log\
+
+Interactive user:
+  config     %USERPROFILE%\.config\p2ptunnel\config.toml
+  identity   %USERPROFILE%\.config\p2ptunnel\identity
+```
+
+The `%ProgramData%` tree must have a DACL granting only `NT SERVICE\p2ptunnel` and
+`BUILTIN\Administrators`, with inheritance enabled so the identity file is protected on
+creation rather than by a later fixup.
+
+### 6.4 Service hosting topology
+
+```text
+              Service Control Manager
+                       │
+             SERVICE_CONTROL_STOP
+                       │
+                       ▼
+            p2p-service-windows            ← SCM plumbing only
+                       │
+              ShutdownToken                ← existing generic primitive
+                       │
+                       ▼
+        run_answer_daemon / run_offer_daemon
+                (unchanged, shared)
+```
+
+`p2p-service-windows` contains SCM registration, the control handler, and status reporting.
+It must contain no tunnel logic. The daemon entry points it calls are the same ones the
+foreground binaries and the Android runtime call.
+
+---
+
+## 7. Security model
+
+| Concern | Unix | Windows |
+|---|---|---|
+| Identity file protection | `0600` mode bits, verified at load | Restrictive DACL applied at install; inherited on creation |
+| Path not writable by others | mode bit `0o002` check | Directory DACL scoped to service account |
+| Enforcement reported | `ENFORCES_FILE_PERMISSIONS = true` | `false` until runtime DACL validation is approved |
+| Wire identity | ed25519 — **identical** | ed25519 — **identical** |
+
+The fail-closed knobs in `AppConfig::validate` remain fail-closed on every platform. They
+are not relaxed for Windows. Where the check cannot be enforced, the daemon must say so at
+startup rather than implying it passed.
+
+---
+
+## 8. Testing strategy
+
+- Unit tests for `p2p-platform` run on both implementations; unix-only assertions are
+  gated within the unix module, not by skipping the crate.
+- `two_node_daemon` (real WebRTC, in-memory signaling) is the portable data-plane gate and
+  must pass on all three desktop platforms.
+- `real_broker_tunnel` stays Linux-only; a Windows-native broker E2E is a P2 goal.
+- `process_signal_shutdown` stays unix-only; a Windows equivalent driven by
+  `SERVICE_CONTROL_STOP` is a P1 goal and must assert the same truthfulness properties:
+  exit code, terminal `Closed` status, no lingering listeners.
+
+## 9. CI
+
+`windows-latest` runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets
+--all-features -- -D warnings`, and `cargo test --workspace --all-targets --all-features`,
+and is a required signoff gate alongside Linux and macOS.
+
+It deliberately does not run the Docker broker E2E — `windows-latest` runners cannot
+reliably host Linux containers — nor the signal lifecycle test, which is unix-only by
+construction.

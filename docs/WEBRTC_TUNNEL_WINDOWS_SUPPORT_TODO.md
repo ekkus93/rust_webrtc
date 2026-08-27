@@ -1,0 +1,440 @@
+# WebRTC Tunnel Windows Support TODO
+
+## 0. Instructions for Claude Code
+
+Implement this TODO against the `windows` branch.
+
+Read first:
+
+```text
+docs/WEBRTC_TUNNEL_WINDOWS_SUPPORT_SPEC.md
+crates/p2p-platform/src/lib.rs
+crates/p2p-platform/src/unix.rs
+crates/p2p-platform/src/windows.rs
+crates/p2p-core/src/config/paths.rs
+crates/p2p-core/src/config/validate.rs
+crates/p2p-crypto/src/identity.rs
+crates/p2p-daemon/src/process_signal.rs
+crates/p2p-daemon/tests/process_signal_shutdown.rs
+bins/p2pctl/src/commands.rs
+bins/p2p-offer/src/main.rs
+bins/p2p-answer/src/main.rs
+.github/workflows/ci.yml
+```
+
+### Non-negotiable implementation rules
+
+- Do not fork the codebase for Windows.
+- Do not add `#[cfg(unix)]`, `#[cfg(windows)]`, or `#[cfg(target_os = ...)]` for
+  permission or home-directory concerns anywhere above `p2p-platform`.
+- Do not change signaling wire format, identity format, crypto, forward semantics, or
+  WebRTC architecture.
+- Do not relax the fail-closed security knobs in `AppConfig::validate` to accommodate
+  Windows.
+- Do not make a platform return `Ok(())` from a security check it cannot actually enforce.
+  Report the gap via `ENFORCES_FILE_PERMISSIONS`.
+- Do not add `unsafe` to `p2p-platform` without explicit sign-off recorded in this file;
+  the workspace sets `unsafe_code = "forbid"` and `p2p-mobile` is its only documented
+  exception.
+- Do not put tunnel logic in `p2p-service-windows`. It is SCM plumbing only.
+- Do not make `ctrl_c()` the service stop path. The SCM sends control codes, not console
+  signals.
+- Do not fix Android host-portability test failures by changing Android app behavior.
+- Do not run the Docker broker E2E on `windows-latest`.
+- Do not suppress lint findings to make a gate pass. See `CLAUDE.md`.
+- Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets`, and
+  `cargo test --workspace` before marking any task complete.
+
+### Priority definitions
+
+```text
+P0 = required for a correct, secure Windows service deployment
+P1 = validation and integration work after P0 is correct
+P2 = packaging and release-matrix work
+```
+
+### Recording decisions
+
+Two open policy questions are called out inline as **DECISION REQUIRED**. Do not
+implement past them without sign-off; record the answer in this file when given.
+
+---
+
+# P0 tasks
+
+## P0-001 — Extract the `p2p-platform` OS seam — **DONE**
+
+### Files
+```text
+crates/p2p-platform/                    (new)
+Cargo.toml
+crates/p2p-core/Cargo.toml
+crates/p2p-core/src/config/paths.rs
+```
+
+### Goal
+Create the single OS seam crate and move `p2p-core`'s home-directory and world-writable
+logic behind it.
+
+### Status
+Complete. `home_dir()`, `ensure_private_file_permissions()`,
+`ensure_not_writable_by_others()`, and `ENFORCES_FILE_PERMISSIONS` exist with unix and
+windows implementations. `p2p-core/src/config/paths.rs` delegates instead of carrying its
+own `cfg` pair.
+
+### Acceptance criteria
+- [x] `p2p-core` contains no `#[cfg(unix)]` for permissions or home resolution.
+- [x] `home_dir()` prefers `USERPROFILE` on Windows and falls back to `HOME`.
+- [x] `cargo test -p p2p-platform -p p2p-core` passes on Windows.
+
+---
+
+## P0-002 — Test-fixture portability — **DONE**
+
+### Files
+```text
+crates/p2p-core/src/config/tests/support.rs
+crates/p2p-core/src/config/tests/loading.rs
+crates/p2p-core/src/config/tests/data_plane.rs
+crates/p2p-core/tests/config_parsing.rs
+crates/p2p-mobile/src/runtime/tests.rs
+crates/p2p-mobile/tests/tracing_install_failure.rs
+bins/p2pctl/src/commands/tests.rs
+```
+
+### Goal
+Fixtures that hand-build TOML embedded raw `Path::display()` output. On Windows those are
+backslashes, and TOML basic strings read `\U` as an 8-digit unicode escape, so configs
+failed to parse.
+
+### Status
+Complete. A `toml_path()` helper doubles backslashes at every hand-built TOML site.
+`advertised_local_ipv4_invalid_is_rejected` no longer builds a directory name from the
+test value `"::1"` (`:` is reserved in Windows paths).
+
+### Acceptance criteria
+- [x] 25 previously failing tests pass across `p2p-core`, `p2p-mobile`, `p2pctl`.
+- [x] Production code unaffected — `identity.rs::render_toml()` never interpolates paths.
+
+---
+
+## P0-003 — Windows CI job — **DONE**
+
+### Files
+```text
+.github/workflows/ci.yml
+```
+
+### Status
+Complete. `test-windows` runs fmt, clippy, and tests on `windows-latest` and is wired into
+the `signoff` gate alongside Linux and macOS.
+
+### Acceptance criteria
+- [x] Job added and required in `signoff`.
+- [ ] **Confirm green on the first real run.** It has only ever been validated on a local
+      Windows machine; the hosted runner may differ. If it fails, fix forward rather than
+      demoting the gate.
+
+---
+
+## P0-004 — Move the remaining unix-only production code behind the seam
+
+### Files
+```text
+crates/p2p-crypto/src/identity.rs
+bins/p2pctl/src/commands.rs
+bins/p2p-offer/src/main.rs
+bins/p2p-answer/src/main.rs
+crates/p2p-platform/src/lib.rs
+crates/p2p-platform/src/unix.rs
+crates/p2p-platform/src/windows.rs
+```
+
+### Goal
+`p2p-crypto` and `p2pctl` still carry their own `#[cfg(unix)]` permission code and `HOME`
+lookups. Move them to the seam so `p2p-platform` is genuinely the only OS-aware place.
+
+### Recommended implementation
+- Replace `identity.rs`'s `validate_private_file_permissions` pair with a call to
+  `p2p_platform::ensure_private_file_permissions`, mapping `PlatformError` to
+  `CryptoError::Permission`.
+- Add `p2p_platform::create_private_file(path, contents)` — `0600` on unix, and on Windows
+  a file created inside a directory whose DACL already restricts it (see P0-006). Use it
+  for `write_identity_files` in `p2pctl`.
+- Replace every `std::env::var_os("HOME")` in the three binaries and `p2pctl` with
+  `p2p_platform::default_config_dir()`.
+
+### Acceptance criteria
+- [ ] `grep -rn 'cfg(unix)' crates bins --include=*.rs` outside `p2p-platform` returns only
+      test files and the Android ICE branches.
+- [ ] `grep -rn 'var_os("HOME")' crates bins --include=*.rs` returns nothing outside
+      `p2p-platform`.
+- [ ] `p2pctl keygen` works from native PowerShell, not only Git Bash.
+
+---
+
+## P0-005 — Report unenforced permission checks at startup
+
+### Files
+```text
+bins/p2p-offer/src/main.rs
+bins/p2p-answer/src/main.rs
+crates/p2p-daemon/src/logging.rs
+```
+
+### Goal
+`AppConfig::validate` refuses to load a config that disables
+`refuse_world_readable_identity` or `refuse_world_writable_paths`, so a user is entitled to
+believe they are enforced. On Windows they currently are not.
+
+### Recommended implementation
+At daemon startup, if `!p2p_platform::ENFORCES_FILE_PERMISSIONS`, emit a single
+`tracing::warn!` naming what is not enforced and what provides the protection instead
+(the config directory DACL). Do not warn per-path; once per process.
+
+### Acceptance criteria
+- [ ] Warning appears exactly once on Windows startup.
+- [ ] No warning on unix.
+- [ ] Wording states plainly that the check did not run, not that it passed.
+
+---
+
+## P0-006 — Windows config and state directory layout
+
+### Files
+```text
+crates/p2p-platform/src/windows.rs
+crates/p2p-platform/src/unix.rs
+docs/WEBRTC_TUNNEL_WINDOWS_SUPPORT_SPEC.md  (section 6.3)
+```
+
+### Goal
+Implement `default_config_dir()` per spec §6.3: `%ProgramData%\p2ptunnel\<role>\` for the
+service, `%USERPROFILE%\.config\p2ptunnel\` for an interactive user.
+
+### Recommended implementation
+Select the service path when running under the service account, otherwise the user path.
+Prefer an explicit `--config` argument over either; do not guess when the caller was
+explicit.
+
+### Acceptance criteria
+- [ ] Both layouts resolve correctly and are covered by unit tests.
+- [ ] Unix behavior is unchanged.
+
+---
+
+## P0-007 — `p2p-service-windows` binary with SCM integration
+
+### Files
+```text
+bins/p2p-service-windows/               (new)
+crates/p2p-daemon/src/process_signal.rs
+```
+
+### Goal
+Host `run_answer_daemon` / `run_offer_daemon` under the Service Control Manager, with
+`SERVICE_CONTROL_STOP` driving the existing `ShutdownToken`.
+
+### Recommended implementation
+- SCM registration, control handler, and `SERVICE_STATUS` reporting live only in this
+  binary.
+- The control handler resolves the same `ShutdownToken` the unix signal adapter produces.
+  Nothing downstream of the token changes.
+- Keep `ctrl_c()` as the foreground-console path; a service and a console process are two
+  producers of one generic shutdown request.
+- Report `SERVICE_STOP_PENDING` with a truthful wait hint while sessions drain, then
+  `SERVICE_STOPPED`.
+
+### DECISION REQUIRED
+SCM integration needs either a crate such as `windows-service` or direct Win32 FFI. If the
+chosen crate is not fully safe, this trips `unsafe_code = "forbid"`. Record the approved
+approach here before implementing.
+
+### Acceptance criteria
+- [ ] `sc.exe start` / `sc.exe stop` work.
+- [ ] Stop is graceful: exit code 0, terminal `Closed` status, no lingering listeners.
+- [ ] Binary contains no tunnel logic.
+
+---
+
+## P0-008 — Service installer: virtual account and restrictive DACL
+
+### Files
+```text
+packaging/windows/                      (new)
+scripts/
+```
+
+### Goal
+Install the service under `NT SERVICE\p2ptunnel` and lock down the config directory.
+
+### Recommended implementation
+- Create the service with `sc.exe create ... obj= "NT SERVICE\p2ptunnel"`, which
+  materializes the virtual account without password management.
+- Apply a DACL to `%ProgramData%\p2ptunnel` granting only that account and
+  `BUILTIN\Administrators`, with inheritance on so the identity file is protected at
+  creation rather than by a later fixup.
+- Mirror the validation style of `scripts/check-systemd-units.sh` and
+  `scripts/check-launchd-plists.sh` with an equivalent Windows check script.
+
+### Acceptance criteria
+- [ ] A standard non-admin user cannot read the installed identity file. Verify with
+      `icacls` and by attempting a read as another account.
+- [ ] The service starts and reaches steady state under the virtual account.
+- [ ] Uninstall removes the service and does not leave the account or ACLs behind.
+
+---
+
+# P1 tasks
+
+## P1-001 — Prove real `mqtts://` signaling on Windows
+
+### Goal
+The Docker broker E2E is Linux-only, so real MQTT-over-TLS signaling has never run on
+Windows. rumqttc and rustls are cross-platform and the risk is low, but it is unverified.
+
+### Recommended implementation
+Install mosquitto natively on Windows (chocolatey) and run a manual offer↔answer tunnel
+against it, forwarding one port. This can precede the automated version in P2-003.
+
+### Acceptance criteria
+- [ ] A Windows peer completes signaling against a real TLS broker and passes data.
+
+---
+
+## P1-002 — Windows shutdown lifecycle test
+
+### Files
+```text
+crates/p2p-daemon/tests/                (new Windows-gated test)
+```
+
+### Goal
+`process_signal_shutdown.rs` is `#![cfg(unix)]`, so Windows has zero coverage of daemon
+shutdown. With RDP forwarded by an always-on service, "did the listener actually close"
+stops being cosmetic.
+
+### Recommended implementation
+Mirror the unix test's assertions — exit code, terminal `Closed` status, no lingering
+listeners — but drive it through `SERVICE_CONTROL_STOP` rather than a signal.
+
+### Acceptance criteria
+- [ ] Test is `#![cfg(windows)]` and runs in the `test-windows` CI job.
+- [ ] Asserts the same truthfulness properties as the unix test.
+
+---
+
+## P1-003 — Android test-harness portability on a Windows host
+
+### Files
+```text
+android/app/src/test/java/com/phillipchin/webrtctunnel/data/ForwardsConfigStoreTest.kt
+android/app/src/test/java/com/phillipchin/webrtctunnel/data/ForwardsRepositoryTest.kt
+android/app/src/test/java/com/phillipchin/webrtctunnel/data/ConfigRepositoryTest.kt
+android/app/src/test/java/com/phillipchin/webrtctunnel/viewmodel/ForwardsViewModelTest.kt
+android/app/src/test/java/com/phillipchin/webrtctunnel/viewmodel/SetupStepValidationTest.kt
+android/app/src/test/java/com/phillipchin/webrtctunnel/ProbeEvidenceShellContractTest.kt
+```
+
+### Goal
+Eight Kotlin unit tests fail on a Windows host. All are test-harness defects, not app
+defects.
+
+Categories:
+1. Six use `File.setReadable(false)` / `setWritable(false)` / `setReadOnly()` to simulate
+   an unreadable file. These are no-ops on Windows — NTFS ACLs do not map to POSIX mode
+   bits — so the error path under test never triggers.
+2. One asserts `template.contains(filesDir.absolutePath)` while the production code
+   correctly TOML-escapes the path.
+3. One invokes bash with an unquoted Windows path, so `\U`-style sequences are stripped.
+
+### Recommended implementation
+Prefer injecting a failing filesystem abstraction over relying on OS permission
+side-effects. Do **not** change app behavior to make these pass.
+
+### Acceptance criteria
+- [ ] `./gradlew check` is green on a Windows host.
+- [ ] Still green on Linux CI.
+- [ ] No production Kotlin behavior changed.
+
+---
+
+## P1-004 — Validate the offer role on Windows
+
+### Goal
+Spec §1 requires both roles. Only the answer role is exercised by the initial deployment.
+
+### Acceptance criteria
+- [ ] A Windows offer peer completes a tunnel against a non-Windows answer peer over a
+      real broker and real network.
+
+---
+
+## P1-005 — Real-network ICE validation
+
+### Goal
+All WebRTC validation so far is loopback. NAT traversal and STUN behaviour on Windows are
+unverified.
+
+### Acceptance criteria
+- [ ] A tunnel is established between two hosts on different networks with a Windows peer
+      at one end.
+
+---
+
+# P2 tasks
+
+## P2-001 — Windows packaging
+
+### Goal
+An installable artifact, matching the intent of `packaging/debian` and `packaging/macos`.
+
+### Acceptance criteria
+- [ ] Produces a signed-installable package that performs P0-008's account and ACL setup.
+- [ ] A documented uninstall path.
+
+---
+
+## P2-002 — Add Windows to the release-artifacts matrix
+
+### Files
+```text
+.github/workflows/ci.yml
+```
+
+### Goal
+`release-artifacts` currently builds `ubuntu-latest` and `macos-latest` only.
+
+### Acceptance criteria
+- [ ] Tagged builds publish a Windows artifact.
+- [ ] Archive format is appropriate for Windows (zip, not tar.gz).
+
+---
+
+## P2-003 — Windows-native broker E2E
+
+### Goal
+Replace the Docker dependency for Windows with a native mosquitto so the real-broker path
+is covered in CI.
+
+### Acceptance criteria
+- [ ] Equivalent coverage to `real_broker_tunnel.rs`, running in the `test-windows` job.
+
+---
+
+## P2-004 — Runtime DACL validation
+
+### Goal
+Defense in depth on top of P0-008's install-time ACL: verify at load time that no ACE
+grants read access to anyone but the owner, SYSTEM, and Administrators, so
+`ENFORCES_FILE_PERMISSIONS` can become `true` on Windows.
+
+### DECISION REQUIRED
+Requires `GetNamedSecurityInfo` and ACL walking through Win32 FFI, which trips
+`unsafe_code = "forbid"`. Either approve a documented `p2p-platform` exception on the
+model of `p2p-mobile`, or adopt a vetted safe wrapper crate. Record the decision here.
+
+### Acceptance criteria
+- [ ] `ENFORCES_FILE_PERMISSIONS` is `true` on Windows.
+- [ ] A deliberately world-readable identity file is rejected at load.
+- [ ] The P0-005 startup warning is removed as no longer applicable.
