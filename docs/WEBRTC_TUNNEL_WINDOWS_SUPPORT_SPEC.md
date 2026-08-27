@@ -310,6 +310,22 @@ The `%ProgramData%` tree must have a DACL granting only `NT SERVICE\p2ptunnel` a
 `BUILTIN\Administrators`, with inheritance enabled so the identity file is protected on
 creation rather than by a later fixup.
 
+#### Logging in service mode
+
+A service runs in Session 0 with no console attached, so `stdout` goes nowhere a user can
+read. A service config must therefore log to a file:
+
+```toml
+[logging]
+file_logging = true
+stdout_logging = false
+log_file = 'C:\ProgramData\p2ptunnel\answer\state\log\p2ptunnel.log'
+```
+
+Leaving `stdout_logging = true` is not an error and does no harm, but on its own it produces
+a service that runs correctly while appearing to emit nothing. The interactive-user layout
+is unaffected and may keep stdout logging.
+
 ### 6.4 Service hosting topology
 
 #### Why a separate wrapper binary rather than making `p2p-answer` SCM-aware
@@ -319,6 +335,22 @@ creation rather than by a later fixup.
 > `p2p-offer` and `p2p-answer` must remain ordinary foreground applications. `systemd`,
 > `launchd`, Docker, a shell, Android, or a test harness may supervise them, but the daemon
 > core must not have a special supervisor-specific mode.
+
+**"Foreground" here is a statement about process lifecycle, not about anything visible on a
+screen.** It means the process does not daemonize itself: no `fork()` into the background,
+no detaching from its parent, no PID file, no `--daemon` flag. It starts, runs as a direct
+child of whatever launched it, and exits when asked. The pattern being banned is the classic
+Unix daemon that forks and orphans itself, which leaves a service manager with no handle on
+the process it is supposed to supervise. `systemd` uses `Type=simple` for exactly this
+reason.
+
+Nothing about this rule implies a window, a console, or a desktop presence. A Windows
+service installed per this spec runs in **Session 0**, which has been isolated from every
+interactive user session since Windows Vista. It has no desktop. There is no window to
+show, minimize, or close; it runs with nobody logged in and survives logoff. It appears in
+`services.msc` and Task Manager's Services tab, and is controlled with `sc.exe start` /
+`sc.exe stop`. The rule and a headless service are not in tension — the rule is what keeps
+the process cleanly supervisable in the first place.
 
 On unix that rule is free, because `systemd` and `launchd` supervise an ordinary foreground
 process from the outside. **Windows is genuinely different.** A service process must call

@@ -303,11 +303,17 @@ Install the service under `NT SERVICE\p2ptunnel` and lock down the config direct
   creation rather than by a later fixup.
 - Mirror the validation style of `scripts/check-systemd-units.sh` and
   `scripts/check-launchd-plists.sh` with an equivalent Windows check script.
+- Any config the installer seeds must set `file_logging = true` and
+  `stdout_logging = false`, with `log_file` under the role's state/log directory. A service
+  has no console, so a stdout-only config yields a service that works correctly while
+  appearing to emit nothing. See spec §6.3.
 
 ### Acceptance criteria
 - [ ] A standard non-admin user cannot read the installed identity file. Verify with
       `icacls` and by attempting a read as another account.
 - [ ] The service starts and reaches steady state under the virtual account.
+- [ ] Log output lands in the role's log file, and is not lost to a nonexistent console.
+- [ ] Service runs with no user logged in and survives logoff.
 - [ ] Uninstall removes the service and does not leave the account or ACLs behind.
 
 ---
