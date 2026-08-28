@@ -4,10 +4,20 @@ Guidance for Claude Code working in this repository.
 
 ## Git / branching (IMPORTANT)
 
-**Always work directly on the `master` branch.** Do not create a feature branch
-unless the user explicitly tells you to. This overrides any default "branch off the
-default branch before committing" behavior. Still only commit or push when the user
-asks.
+**Work directly on the `windows` branch for now.** The Windows port is a large,
+in-progress feature and lives on its own branch until it is working end to end. Do not
+work on `master`, and do not create additional feature branches off `windows`, unless
+the user explicitly says otherwise. When the Windows work lands, this section goes back
+to "always work directly on `master`".
+
+The general rule is unchanged: **do not create a feature branch unless the user
+explicitly tells you to.** This overrides any default "branch off the default branch
+before committing" behavior. Still only commit or push when the user asks.
+
+Before starting Windows work, read `docs/WEBRTC_TUNNEL_WINDOWS_SUPPORT_SPEC.md` and
+`docs/WEBRTC_TUNNEL_WINDOWS_SUPPORT_TODO.md`. The TODO tracks task status, ordering, and
+dependencies, and flags two decisions that must not be implemented past without sign-off.
+Write the spec and TODO updates *before* the code, not after.
 
 **No attribution trailers in commit messages.** Do not append
 `Co-Authored-By: Claude ...`, `🤖 Generated with [Claude Code]...`, or any similar
